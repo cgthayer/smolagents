@@ -23,23 +23,23 @@ from huggingface_hub import ChatCompletionOutputMessage
 
 from smolagents.default_tools import FinalAnswerTool
 from smolagents.models import (
-    AmazonBedrockServerModel,
-    AzureOpenAIServerModel,
+    AmazonBedrockModel,
+    AzureOpenAIModel,
     ChatMessage,
     ChatMessageToolCall,
-    HfApiModel,
     InferenceClientModel,
     LiteLLMModel,
     LiteLLMRouterModel,
     MessageRole,
     MLXModel,
     Model,
-    OpenAIServerModel,
+    OpenAIModel,
     TransformersModel,
     get_clean_message_list,
     get_tool_call_from_text,
     get_tool_json_schema,
     parse_json_if_needed,
+    remove_content_after_stop_sequences,
     supports_stop_parameter,
 )
 from smolagents.tools import tool
@@ -48,6 +48,97 @@ from .utils.markers import require_run_all
 
 
 class TestModel:
+    def test_prepare_completion_kwargs_parameter_precedence(self):
+        """Test that self.kwargs have highest precedence and REMOVE_PARAMETER works correctly"""
+        from smolagents.models import REMOVE_PARAMETER
+
+        # Test with self.kwargs having highest precedence
+        model = Model(max_tokens=100, temperature=0.5)
+        completion_kwargs = model._prepare_completion_kwargs(
+            messages=[ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Hello"}])],
+            max_tokens=50,  # This should be overridden by self.kwargs
+            top_p=0.9,  # This should remain from kwargs
+        )
+
+        # self.kwargs should have highest precedence
+        assert completion_kwargs["max_tokens"] == 100
+        assert completion_kwargs["temperature"] == 0.5
+        assert completion_kwargs["top_p"] == 0.9
+
+        # Test REMOVE_PARAMETER functionality
+        model_with_removal = Model(max_tokens=REMOVE_PARAMETER, temperature=0.7)
+        completion_kwargs = model_with_removal._prepare_completion_kwargs(
+            messages=[ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Hello"}])],
+            max_tokens=200,  # This should be removed by REMOVE_PARAMETER
+            top_p=0.8,
+        )
+
+        # max_tokens should be removed, temperature should be set
+        assert "max_tokens" not in completion_kwargs
+        assert completion_kwargs["temperature"] == 0.7
+        assert completion_kwargs["top_p"] == 0.8
+
+    def test_agglomerate_stream_deltas(self):
+        from smolagents.models import (
+            ChatMessageStreamDelta,
+            ChatMessageToolCallFunction,
+            ChatMessageToolCallStreamDelta,
+            TokenUsage,
+            agglomerate_stream_deltas,
+        )
+
+        stream_deltas = [
+            ChatMessageStreamDelta(
+                content="Hi",
+                tool_calls=[
+                    ChatMessageToolCallStreamDelta(
+                        index=0,
+                        type="function",
+                        function=ChatMessageToolCallFunction(arguments="", name="web_search", description=None),
+                    )
+                ],
+                token_usage=None,
+            ),
+            ChatMessageStreamDelta(
+                content=" everyone",
+                tool_calls=[
+                    ChatMessageToolCallStreamDelta(
+                        index=0,
+                        type="function",
+                        function=ChatMessageToolCallFunction(arguments=' {"', name="web_search", description=None),
+                    )
+                ],
+                token_usage=None,
+            ),
+            ChatMessageStreamDelta(
+                content=", it's",
+                tool_calls=[
+                    ChatMessageToolCallStreamDelta(
+                        index=0,
+                        type="function",
+                        function=ChatMessageToolCallFunction(
+                            arguments='query": "current pope name and date of birth"}',
+                            name="web_search",
+                            description=None,
+                        ),
+                    )
+                ],
+                token_usage=None,
+            ),
+            ChatMessageStreamDelta(
+                content="",
+                tool_calls=None,
+                token_usage=TokenUsage(input_tokens=1348, output_tokens=24),
+            ),
+        ]
+        agglomerated_stream_delta = agglomerate_stream_deltas(stream_deltas)
+        assert agglomerated_stream_delta.content == "Hi everyone, it's"
+        assert (
+            agglomerated_stream_delta.tool_calls[0].function.arguments
+            == ' {"query": "current pope name and date of birth"}'
+        )
+        assert agglomerated_stream_delta.token_usage.total_tokens == 1372
+
     @pytest.mark.parametrize(
         "model_id, stop_sequences, should_contain_stop",
         [
@@ -65,7 +156,10 @@ class TestModel:
         model = Model()
         model.model_id = model_id
         completion_kwargs = model._prepare_completion_kwargs(
-            messages=[{"role": "user", "content": [{"type": "text", "text": "Hello"}]}], stop_sequences=stop_sequences
+            messages=[
+                ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Hello"}]),
+            ],
+            stop_sequences=stop_sequences,
         )
         # Verify that the stop parameter is only included when appropriate
         if should_contain_stop:
@@ -100,7 +194,7 @@ class TestModel:
     )
     def test_prepare_completion_kwargs_tool_choice(self, with_tools, tool_choice, expected_result, example_tool):
         model = Model()
-        kwargs = {"messages": [{"role": "user", "content": [{"type": "text", "text": "Hello"}]}]}
+        kwargs = {"messages": [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Hello"}])]}
         if with_tools:
             kwargs["tools_to_call_from"] = [example_tool]
         if tool_choice is not ...:
@@ -137,7 +231,7 @@ class TestModel:
     @unittest.skipUnless(sys.platform.startswith("darwin"), "requires macOS")
     def test_get_mlx_message_no_tool(self):
         model = MLXModel(model_id="HuggingFaceTB/SmolLM2-135M-Instruct", max_tokens=10)
-        messages = [{"role": "user", "content": [{"type": "text", "text": "Hello!"}]}]
+        messages = [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Hello!"}])]
         output = model(messages, stop_sequences=["great"]).content
         assert output.startswith("Hello")
 
@@ -147,7 +241,9 @@ class TestModel:
         # which is required to test capturing stop_sequences that have extra chars at the end.
         model = MLXModel(model_id="HuggingFaceTB/SmolLM2-135M-Instruct", max_tokens=100)
         stop_sequence = " print '>"
-        messages = [{"role": "user", "content": [{"type": "text", "text": f"Please{stop_sequence}'"}]}]
+        messages = [
+            ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": f"Please{stop_sequence}'"}]),
+        ]
         # check our assumption that that ">" is followed by "'"
         assert model.tokenizer.vocab[">'"]
         assert model(messages, stop_sequences=[]).content == f"I'm ready to help you{stop_sequence}'"
@@ -162,7 +258,7 @@ class TestModel:
             device_map="cpu",
             do_sample=False,
         )
-        messages = [{"role": "user", "content": [{"type": "text", "text": "Hello!"}]}]
+        messages = [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Hello!"}])]
         output = model.generate(messages).content
         assert output == "Hello! I'm here"
 
@@ -184,7 +280,10 @@ class TestModel:
             do_sample=False,
         )
         messages = [
-            {"role": "user", "content": [{"type": "text", "text": "What is this?"}, {"type": "image", "image": img}]}
+            ChatMessage(
+                role=MessageRole.USER,
+                content=[{"type": "text", "text": "What is this?"}, {"type": "image", "image": img}],
+            )
         ]
         output = model.generate(messages).content
         assert output == "This is a very"
@@ -219,8 +318,8 @@ class TestInferenceClientModel:
         model = InferenceClientModel(model_id="test-model", custom_role_conversions=custom_role_conversions)
         model.client = MagicMock()
         mock_response = model.client.chat_completion.return_value
-        mock_response.choices[0].message = ChatCompletionOutputMessage(role="assistant")
-        messages = [{"role": "user", "content": "Test message"}]
+        mock_response.choices[0].message = ChatCompletionOutputMessage(role=MessageRole.ASSISTANT)
+        messages = [ChatMessage(role=MessageRole.USER, content="Test message")]
         _ = model(messages)
         # Verify that the role conversion was applied
         assert model.client.chat_completion.call_args.kwargs["messages"][0]["role"] == "system", (
@@ -242,71 +341,123 @@ class TestInferenceClientModel:
             ValueError, match="InferenceClientModel only supports structured outputs with these providers:"
         ):
             model = InferenceClientModel(model_id="test-model", token="abc", provider="some_provider")
-            model.generate(messages=[{"role": "user", "content": "Hello!"}], response_format={"type": "json_object"})
+            model.generate(
+                messages=[ChatMessage(role=MessageRole.USER, content="Hello!")],
+                response_format={"type": "json_object"},
+            )
 
     @require_run_all
     def test_get_hfapi_message_no_tool(self):
         model = InferenceClientModel(model_id="Qwen/Qwen2.5-Coder-32B-Instruct", max_tokens=10)
-        messages = [{"role": "user", "content": [{"type": "text", "text": "Hello!"}]}]
+        messages = [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Hello!"}])]
         model(messages, stop_sequences=["great"])
 
     @require_run_all
     def test_get_hfapi_message_no_tool_external_provider(self):
         model = InferenceClientModel(model_id="Qwen/Qwen2.5-Coder-32B-Instruct", provider="together", max_tokens=10)
-        messages = [{"role": "user", "content": [{"type": "text", "text": "Hello!"}]}]
+        messages = [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Hello!"}])]
         model(messages, stop_sequences=["great"])
 
     @require_run_all
     def test_get_hfapi_message_stream_no_tool(self):
         model = InferenceClientModel(model_id="Qwen/Qwen2.5-Coder-32B-Instruct", max_tokens=10)
-        messages = [{"role": "user", "content": [{"type": "text", "text": "Hello!"}]}]
+        messages = [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Hello!"}])]
         for el in model.generate_stream(messages, stop_sequences=["great"]):
             assert el.content is not None
 
     @require_run_all
     def test_get_hfapi_message_stream_no_tool_external_provider(self):
         model = InferenceClientModel(model_id="Qwen/Qwen2.5-Coder-32B-Instruct", provider="together", max_tokens=10)
-        messages = [{"role": "user", "content": [{"type": "text", "text": "Hello!"}]}]
+        messages = [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Hello!"}])]
         for el in model.generate_stream(messages, stop_sequences=["great"]):
             assert el.content is not None
 
 
-class TestHfApiModel:
-    def test_deprecation_warning(self):
-        """Test that HfApiModel raises a deprecation warning when instantiated."""
-        # Should raise FutureWarning with specific message
-        with pytest.warns(
-            FutureWarning,
-            match="HfApiModel was renamed to InferenceClientModel in version 1.14.0 and will be removed in 1.17.0.",
-        ):
-            model = HfApiModel(model_id="test-model")
-        # Verify it returns an instance of InferenceClientModel
-        assert isinstance(model, InferenceClientModel)
-        # Verify the model_id was properly passed through
-        assert model.model_id == "test-model"
-
-
 class TestLiteLLMModel:
     @pytest.mark.parametrize(
-        "model_id, error_flag",
+        "model_id",
         [
-            ("groq/llama-3.3-70b", "Invalid API Key"),
-            ("cerebras/llama-3.3-70b", "The api_key client option must be set"),
-            ("mistral/mistral-tiny", "The api_key client option must be set"),
+            "groq/llama-3.3-70b",
+            "cerebras/llama-3.3-70b",
+            "mistral/mistral-tiny",
         ],
     )
-    def test_call_different_providers_without_key(self, model_id, error_flag):
+    def test_call_different_providers_without_key(self, model_id):
+        # Different litellm versions produce different error messages for missing API keys
+        # This test checks for the presence of any common authentication-related error phrases
+        possible_error_messages = [
+            "Missing API Key",
+            "Wrong API Key",
+            "Invalid API Key",
+            "The api_key client option must be set",
+            "AuthenticationError",
+            "Unauthorized",
+        ]
         model = LiteLLMModel(model_id=model_id)
-        messages = [{"role": "user", "content": [{"type": "text", "text": "Test message"}]}]
+        messages = [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Test message"}])]
+        # Test generate method
         with pytest.raises(Exception) as e:
-            # This should raise 401 error because of missing API key, not fail for any "bad format" reason
             model.generate(messages)
-        assert error_flag in str(e)
+        error_message = str(e)
+        assert any(possible_error_message in error_message for possible_error_message in possible_error_messages), (
+            f"Error message '{error_message}' does not contain any expected phrases"
+        )
+        # Test generate_stream method
         with pytest.raises(Exception) as e:
-            # This should raise 401 error because of missing API key, not fail for any "bad format" reason
             for el in model.generate_stream(messages):
                 assert el.content is not None
-        assert error_flag in str(e)
+        error_message = str(e)
+        assert any(possible_error_message in error_message for possible_error_message in possible_error_messages), (
+            f"Error message '{error_message}' does not contain any expected phrases"
+        )
+
+    def test_retry_on_rate_limit_error(self):
+        """Test that the retry mechanism does trigger on 429 rate limit errors"""
+        import time
+
+        # Patch RETRY_WAIT to 1 second for faster testing
+        mock_litellm = MagicMock()
+
+        with (
+            patch("smolagents.models.RETRY_WAIT", 0.1),
+            patch("smolagents.utils.random.random", side_effect=[0.1, 0.1]),
+            patch("smolagents.models.LiteLLMModel.create_client", return_value=mock_litellm),
+        ):
+            model = LiteLLMModel(model_id="test-model")
+            messages = [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Test message"}])]
+
+            # Create a mock response for successful call
+            mock_success_response = MagicMock()
+            mock_success_response.choices = [MagicMock()]
+            # Set content directly (not through model_dump)
+            mock_success_response.choices[0].message.content = "Success response"
+            mock_success_response.choices[0].message.role = "assistant"
+            mock_success_response.choices[0].message.tool_calls = None
+            mock_success_response.usage.prompt_tokens = 10
+            mock_success_response.usage.completion_tokens = 20
+
+            # Create a 429 rate limit error
+            rate_limit_error = Exception("Error code: 429 - Rate limit exceeded")
+
+            # Mock the litellm client to raise an error twice, and then succeed
+            model.client.completion.side_effect = [rate_limit_error, rate_limit_error, mock_success_response]
+
+            # Measure time to verify retry wait time
+            start_time = time.time()
+            result = model.generate(messages)
+            elapsed_time = time.time() - start_time
+
+            # Verify that completion was called thrice (twice failed, once succeeded)
+            assert model.client.completion.call_count == 3
+            assert result.content == "Success response"
+            assert result.token_usage.input_tokens == 10
+            assert result.token_usage.output_tokens == 20
+
+            # Verify that the wait time was around
+            # 0.22s (1st retry) [0.1 * 2.0 * (1 + 1 * 0.1)]
+            # + 0.48s (2nd retry) [0.22 * 2.0 * (1 + 1 * 0.1)]
+            # = 0.704s (allow some tolerance)
+            assert 0.67 <= elapsed_time <= 0.73
 
     def test_passing_flatten_messages(self):
         model = LiteLLMModel(model_id="groq/llama-3.3-70b", flatten_messages_as_text=False)
@@ -339,7 +490,7 @@ class TestLiteLLMRouterModel:
             {"model_name": "llama-3.3-70b", "litellm_params": {"model": "groq/llama-3.3-70b"}},
             {"model_name": "llama-3.3-70b", "litellm_params": {"model": "cerebras/llama-3.3-70b"}},
         ]
-        with patch("litellm.Router") as mock_router:
+        with patch("litellm.router.Router") as mock_router:
             router_model = LiteLLMRouterModel(
                 model_id="model-group-1", model_list=model_list, client_kwargs={"routing_strategy": "simple-shuffle"}
             )
@@ -351,7 +502,7 @@ class TestLiteLLMRouterModel:
             assert router_model.client == mock_router.return_value
 
 
-class TestOpenAIServerModel:
+class TestOpenAIModel:
     def test_client_kwargs_passed_correctly(self):
         model_id = "gpt-3.5-turbo"
         api_base = "https://api.openai.com/v1"
@@ -361,7 +512,7 @@ class TestOpenAIServerModel:
         client_kwargs = {"max_retries": 5}
 
         with patch("openai.OpenAI") as MockOpenAI:
-            model = OpenAIServerModel(
+            model = OpenAIModel(
                 model_id=model_id,
                 api_base=api_base,
                 api_key=api_key,
@@ -376,17 +527,17 @@ class TestOpenAIServerModel:
 
     @require_run_all
     def test_streaming_tool_calls(self):
-        model = OpenAIServerModel(model_id="gpt-4o-mini")
+        model = OpenAIModel(model_id="gpt-4o-mini")
         messages = [
-            {
-                "role": "user",
-                "content": [
+            ChatMessage(
+                role=MessageRole.USER,
+                content=[
                     {
                         "type": "text",
                         "text": "Hello! Please return the final answer 'blob' and the final answer 'blob2' in two parallel tool calls",
                     }
                 ],
-            }
+            ),
         ]
         for el in model.generate_stream(messages, tools_to_call_from=[FinalAnswerTool()]):
             if el.tool_calls:
@@ -398,20 +549,45 @@ class TestOpenAIServerModel:
         assert args == '{"answer": "blob"}'
         assert args2 == '{"answer": "blob2"}'
 
+    def test_stop_sequence_cutting_for_o4_mini(self):
+        """Test that stop sequences are cut a posteriori for models that don't support stop parameter"""
+        # Create a mock response that contains a stop sequence in the middle
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.role = "assistant"
+        mock_response.choices[0].message.content = "This is some text<STOP>and this should be removed"
+        mock_response.choices[0].message.tool_calls = None
+        mock_response.usage.prompt_tokens = 10
+        mock_response.usage.completion_tokens = 20
 
-class TestAmazonBedrockServerModel:
+        with patch("openai.OpenAI") as MockOpenAI:
+            mock_client = MagicMock()
+            MockOpenAI.return_value = mock_client
+            mock_client.chat.completions.create.return_value = mock_response
+
+            model = OpenAIModel(model_id="o4-mini")
+            messages = [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Hello"}])]
+            result = model.generate(messages, stop_sequences=["<STOP>"])
+
+            # Verify the stop sequence was removed
+            assert result.content == "This is some text"
+            assert "<STOP>" not in result.content
+            assert "and this should be removed" not in result.content
+
+
+class TestAmazonBedrockModel:
     def test_client_for_bedrock(self):
         model_id = "us.amazon.nova-pro-v1:0"
 
         with patch("boto3.client") as MockBoto3:
-            model = AmazonBedrockServerModel(
+            model = AmazonBedrockModel(
                 model_id=model_id,
             )
 
         assert model.client == MockBoto3.return_value
 
 
-class TestAzureOpenAIServerModel:
+class TestAzureOpenAIModel:
     def test_client_kwargs_passed_correctly(self):
         model_id = "gpt-3.5-turbo"
         api_key = "test_api_key"
@@ -422,7 +598,7 @@ class TestAzureOpenAIServerModel:
         client_kwargs = {"max_retries": 5}
 
         with patch("openai.OpenAI") as MockOpenAI, patch("openai.AzureOpenAI") as MockAzureOpenAI:
-            model = AzureOpenAIServerModel(
+            model = AzureOpenAIModel(
                 model_id=model_id,
                 api_key=api_key,
                 api_version=api_version,
@@ -493,8 +669,8 @@ class TestTransformersModel:
 
 def test_get_clean_message_list_basic():
     messages = [
-        {"role": "user", "content": [{"type": "text", "text": "Hello!"}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "Hi there!"}]},
+        ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Hello!"}]),
+        ChatMessage(role=MessageRole.ASSISTANT, content=[{"type": "text", "text": "Hi there!"}]),
     ]
     result = get_clean_message_list(messages)
     assert len(result) == 2
@@ -504,10 +680,38 @@ def test_get_clean_message_list_basic():
     assert result[1]["content"][0]["text"] == "Hi there!"
 
 
+@pytest.mark.parametrize(
+    "messages,expected_roles,expected_texts",
+    [
+        (
+            [
+                {"role": "user", "content": [{"type": "text", "text": "Hello!"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "Hi there!"}]},
+            ],
+            ["user", "assistant"],
+            ["Hello!", "Hi there!"],
+        ),
+        (
+            [
+                {"role": "user", "content": [{"type": "text", "text": "How are you?"}]},
+            ],
+            ["user"],
+            ["How are you?"],
+        ),
+    ],
+)
+def test_get_clean_message_list_with_dicts(messages, expected_roles, expected_texts):
+    result = get_clean_message_list(messages)
+    assert len(result) == len(messages)
+    for i, msg in enumerate(result):
+        assert msg["role"] == expected_roles[i]
+        assert msg["content"][0]["text"] == expected_texts[i]
+
+
 def test_get_clean_message_list_role_conversions():
     messages = [
-        {"role": "tool-call", "content": [{"type": "text", "text": "Calling tool..."}]},
-        {"role": "tool-response", "content": [{"type": "text", "text": "Tool response"}]},
+        ChatMessage(role=MessageRole.TOOL_CALL, content=[{"type": "text", "text": "Calling tool..."}]),
+        ChatMessage(role=MessageRole.TOOL_RESPONSE, content=[{"type": "text", "text": "Tool response"}]),
     ]
     result = get_clean_message_list(messages, role_conversions={"tool-call": "assistant", "tool-response": "user"})
     assert len(result) == 2
@@ -517,41 +721,57 @@ def test_get_clean_message_list_role_conversions():
     assert result[1]["content"][0]["text"] == "Tool response"
 
 
+def test_remove_content_after_stop_sequences():
+    content = "Hello<code>world!"
+    stop_sequences = ["<code>"]
+    removed_content = remove_content_after_stop_sequences(content, stop_sequences)
+    assert removed_content == "Hello"
+
+
+def test_remove_content_after_stop_sequences_handles_none():
+    # Test with None stop sequence
+    content = "Hello world!"
+    removed_content = remove_content_after_stop_sequences(content, None)
+    assert removed_content == content
+
+    # Test with None content
+    removed_content = remove_content_after_stop_sequences(None, ["<code>"])
+    assert removed_content is None
+
+
 @pytest.mark.parametrize(
     "convert_images_to_image_urls, expected_clean_message",
     [
         (
             False,
-            {
-                "role": "user",
-                "content": [
+            dict(
+                role=MessageRole.USER,
+                content=[
                     {"type": "image", "image": "encoded_image"},
                     {"type": "image", "image": "second_encoded_image"},
                 ],
-            },
+            ),
         ),
         (
             True,
-            {
-                "role": "user",
-                "content": [
+            dict(
+                role=MessageRole.USER,
+                content=[
                     {"type": "image_url", "image_url": {"url": "data:image/png;base64,encoded_image"}},
                     {"type": "image_url", "image_url": {"url": "data:image/png;base64,second_encoded_image"}},
                 ],
-            },
+            ),
         ),
     ],
 )
 def test_get_clean_message_list_image_encoding(convert_images_to_image_urls, expected_clean_message):
-    messages = [
-        {
-            "role": "user",
-            "content": [{"type": "image", "image": b"image_data"}, {"type": "image", "image": b"second_image_data"}],
-        }
-    ]
+    message = ChatMessage(
+        role=MessageRole.USER,
+        content=[{"type": "image", "image": b"image_data"}, {"type": "image", "image": b"second_image_data"}],
+    )
     with patch("smolagents.models.encode_image_base64") as mock_encode:
         mock_encode.side_effect = ["encoded_image", "second_encoded_image"]
-        result = get_clean_message_list(messages, convert_images_to_image_urls=convert_images_to_image_urls)
+        result = get_clean_message_list([message], convert_images_to_image_urls=convert_images_to_image_urls)
         mock_encode.assert_any_call(b"image_data")
         mock_encode.assert_any_call(b"second_image_data")
         assert len(result) == 1
@@ -560,8 +780,8 @@ def test_get_clean_message_list_image_encoding(convert_images_to_image_urls, exp
 
 def test_get_clean_message_list_flatten_messages_as_text():
     messages = [
-        {"role": "user", "content": [{"type": "text", "text": "Hello!"}]},
-        {"role": "user", "content": [{"type": "text", "text": "How are you?"}]},
+        ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Hello!"}]),
+        ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "How are you?"}]),
     ]
     result = get_clean_message_list(messages, flatten_messages_as_text=True)
     assert len(result) == 1
@@ -572,15 +792,15 @@ def test_get_clean_message_list_flatten_messages_as_text():
 @pytest.mark.parametrize(
     "model_class, model_kwargs, patching, expected_flatten_messages_as_text",
     [
-        (AzureOpenAIServerModel, {}, ("openai.AzureOpenAI", {}), False),
+        (AzureOpenAIModel, {}, ("openai.AzureOpenAI", {}), False),
         (InferenceClientModel, {}, ("huggingface_hub.InferenceClient", {}), False),
         (LiteLLMModel, {}, None, False),
         (LiteLLMModel, {"model_id": "ollama"}, None, True),
         (LiteLLMModel, {"model_id": "groq"}, None, True),
         (LiteLLMModel, {"model_id": "cerebras"}, None, True),
         (MLXModel, {}, ("mlx_lm.load", {"return_value": (MagicMock(), MagicMock())}), True),
-        (OpenAIServerModel, {}, ("openai.OpenAI", {}), False),
-        (OpenAIServerModel, {"flatten_messages_as_text": True}, ("openai.OpenAI", {}), True),
+        (OpenAIModel, {}, ("openai.OpenAI", {}), False),
+        (OpenAIModel, {"flatten_messages_as_text": True}, ("openai.OpenAI", {}), True),
         (
             TransformersModel,
             {},
@@ -626,6 +846,13 @@ def test_flatten_messages_as_text_for_all_models(
         # Unsupported base models
         ("o3", False),
         ("o4-mini", False),
+        ("gpt-5", False),
+        ("gpt-5-mini", False),
+        ("gpt-5-nano", False),
+        ("grok-4", False),
+        ("grok-4-latest", False),
+        ("grok-3-mini", False),
+        ("grok-code-fast-1", False),
         # Unsupported versioned models
         ("o3-2025-04-16", False),
         ("o4-mini-2025-04-16", False),
@@ -634,12 +861,16 @@ def test_flatten_messages_as_text_for_all_models(
         ("openai/o4-mini", False),
         ("openai/o3-2025-04-16", False),
         ("openai/o4-mini-2025-04-16", False),
+        ("oci/xai.grok-4", False),
+        ("oci/xai.grok-3-mini", False),
         # Supported models
         ("o3-mini", True),  # Different from o3
         ("o3-mini-2025-01-31", True),  # Different from o3
         ("o4", True),  # Different from o4-mini
         ("o4-turbo", True),  # Different from o4-mini
         ("gpt-4", True),
+        ("gpt-5-turbo", True),  # Different from gpt-5
+        ("grok-3", True),  # Different from grok-3-mini
         ("claude-3-5-sonnet", True),
         ("mistral-large", True),
         # Supported models with path prefixes
@@ -678,7 +909,7 @@ class TestGetToolCallFromText:
         with pytest.raises(ValueError) as exc_info:
             get_tool_call_from_text(text, "name", "arguments")
         error_msg = str(exc_info.value)
-        assert "Key tool_name_key='name' not found" in error_msg
+        assert "Tool call needs to have a key 'name'" in error_msg
         assert "'action', 'arguments'" in error_msg
 
     def test_get_tool_call_from_text_json_object_args(self):

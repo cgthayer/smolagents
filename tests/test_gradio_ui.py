@@ -141,8 +141,6 @@ class TestStreamToGradio:
         mock_agent = Mock()
         mock_agent.run = Mock(return_value=[Mock(spec=ActionStep)])
         mock_agent.model = Mock()
-        mock_agent.model.last_input_token_count = 100
-        mock_agent.model.last_output_token_count = 200
         # Mock the pull_messages_from_step function to return some messages
         mock_message = Mock()
         mock_pull_messages.return_value = [mock_message]
@@ -159,8 +157,6 @@ class TestStreamToGradio:
         mock_delta = ChatMessageStreamDelta(content="Hello")
         mock_agent.run = Mock(return_value=[mock_delta])
         mock_agent.model = Mock()
-        mock_agent.model.last_input_token_count = 100
-        mock_agent.model.last_output_token_count = 200
         # Call stream_to_gradio
         result = list(stream_to_gradio(mock_agent, "test task"))
         # Verify that the content was yielded
@@ -174,8 +170,6 @@ class TestStreamToGradio:
         mock_delta2 = ChatMessageStreamDelta(content=" world")
         mock_agent.run = Mock(return_value=[mock_delta1, mock_delta2])
         mock_agent.model = Mock()
-        mock_agent.model.last_input_token_count = 100
-        mock_agent.model.last_output_token_count = 200
         # Call stream_to_gradio
         result = list(stream_to_gradio(mock_agent, "test task"))
         # Verify that the content was accumulated and yielded
@@ -278,11 +272,7 @@ class TestPullMessagesFromStep:
             for msg in messages
             if msg.role == "assistant" and msg.metadata and msg.metadata.get("title", "").startswith("🛠️")
         )
-        # For the Python interpreter, check that code is properly formatted
-        if tool_name == "python_interpreter":
-            assert "```python" in tool_message.content
-        else:
-            assert expected in tool_message.content
+        assert expected in tool_message.content
 
     def test_action_step_with_error(self):
         """Test ActionStep with error."""

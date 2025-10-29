@@ -37,7 +37,7 @@ def parse_arguments():
         "--model-type",
         type=str,
         default="LiteLLMModel",
-        help="The model type to use (e.g., OpenAIServerModel, LiteLLMModel, TransformersModel, InferenceClientModel)",
+        help="The model type to use (e.g., OpenAIModel, LiteLLMModel, TransformersModel, InferenceClientModel)",
     )
     parser.add_argument(
         "--model-id",
@@ -84,6 +84,24 @@ def save_screenshot(memory_step: ActionStep, agent: CodeAgent) -> None:
     return
 
 
+def _escape_xpath_string(s: str) -> str:
+    """
+    Escapes a string for safe use in an XPath expression.
+
+    Args:
+        s (`str`): Arbitrary input string to escape.
+
+    Returns:
+        `str`: Valid XPath expression representing the literal value of `s`.
+    """
+    if "'" not in s:
+        return f"'{s}'"
+    if '"' not in s:
+        return f'"{s}"'
+    parts = s.split("'")
+    return "concat(" + ', "\'", '.join(f"'{p}'" for p in parts) + ")"
+
+
 @tool
 def search_item_ctrl_f(text: str, nth_result: int = 1) -> str:
     """
@@ -92,7 +110,8 @@ def search_item_ctrl_f(text: str, nth_result: int = 1) -> str:
         text: The text to search for
         nth_result: Which occurrence to jump to (default: 1)
     """
-    elements = driver.find_elements(By.XPATH, f"//*[contains(text(), '{text}')]")
+    escaped_text = _escape_xpath_string(text)
+    elements = driver.find_elements(By.XPATH, f"//*[contains(text(), {escaped_text})]")
     if nth_result > len(elements):
         raise Exception(f"Match n°{nth_result} not found (only {len(elements)} matches found)")
     result = f"Found {len(elements)} matches for '{text}'."
@@ -144,53 +163,46 @@ Then you can use helium to access websites. Don't use helium for Google search, 
 Don't bother about the helium driver, it's already managed.
 We've already ran "from helium import *"
 Then you can go to pages!
-Code:
-```py
+<code>
 go_to('github.com/trending')
-```<end_code>
+</code>
 
 You can directly click clickable elements by inputting the text that appears on them.
-Code:
-```py
+<code>
 click("Top products")
-```<end_code>
+</code>
 
 If it's a link:
-Code:
-```py
+<code>
 click(Link("Top products"))
-```<end_code>
+</code>
 
 If you try to interact with an element and it's not found, you'll get a LookupError.
 In general stop your action after each button click to see what happens on your screenshot.
 Never try to login in a page.
 
 To scroll up or down, use scroll_down or scroll_up with as an argument the number of pixels to scroll from.
-Code:
-```py
+<code>
 scroll_down(num_pixels=1200) # This will scroll one viewport down
-```<end_code>
+</code>
 
 When you have pop-ups with a cross icon to close, don't try to click the close icon by finding its element or targeting an 'X' element (this most often fails).
 Just use your built-in tool `close_popups` to close them:
-Code:
-```py
+<code>
 close_popups()
-```<end_code>
+</code>
 
 You can use .exists() to check for the existence of an element. For example:
-Code:
-```py
+<code>
 if Text('Accept cookies?').exists():
     click('I accept')
-```<end_code>
+</code>
 
 Proceed in several steps rather than trying to solve the task in one shot.
 And at the end, only when you have your answer, return your final answer.
-Code:
-```py
+<code>
 final_answer("YOUR_ANSWER_HERE")
-```<end_code>
+</code>
 
 If pages seem stuck on loading, you might have to wait, for instance `import time` and run `time.sleep(5.0)`. But don't overuse this!
 To list elements on page, DO NOT try code-based element searches like 'contributors = find_all(S("ol > li"))': just look at the latest screenshot you have and read it visually, or use your tool search_item_ctrl_f.
